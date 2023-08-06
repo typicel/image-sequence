@@ -1,3 +1,4 @@
 # Image Sequencer
 
-Was forced to make this
+Rust egui app that lets you play a series of images in order, if you need that for some reason.
+
