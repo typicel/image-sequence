@@ -1,86 +1,40 @@
-use egui_extras::RetainedImage;
+use std::default::Default;
+use std::path::{Path};
+use std::sync::{Arc, Mutex};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use std::path::Path;
-use walkdir::WalkDir;
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::image_sequence::ImageSequence;
 
 pub struct ImageSequencerApp {
-    watcher: Option<RecommendedWatcher>,
-    directory: Option<String>,
-    images: Vec<String>,
+    watcher: RecommendedWatcher,
+    image_sequence: Arc<Mutex<Option<ImageSequence>>>,
     idx: usize,
-}
-
-impl Default for ImageSequencerApp {
-    fn default() -> Self {
-        Self {
-            watcher: None,
-            directory: None,
-            images: Vec::new(),
-            idx: 0,
-        }
-    }
+    playing: bool,
 }
 
 impl ImageSequencerApp {
     /// Called once before the first frame.
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        Default::default()
-    }
-}
+    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        let image_sequence = Arc::new(Mutex::new(Option::<ImageSequence>::None));
 
-impl ImageSequencerApp {
-    fn watch_directory(&mut self, directory: &str) {
-        let self_rc = Rc::new(RefCell::new(self.clone()));
-        let mut watcher = notify::recommended_watcher(move |res: Result<notify::event::Event, notify::Error>| match res {
-            Ok(event) => match event.kind {
-                notify::EventKind::Modify(_) => {
-                    let mut self_ref = self_rc.borrow_mut();
-                    self.load_images_from_directory(directory);
-                }
-                _ => {}
-            },
-            Err(e) => println!("watch error: {:?}", e),
-        })
-        .unwrap();
-
-        watcher
-            .watch(Path::new(directory), RecursiveMode::Recursive)
-            .unwrap();
-
-        self.watcher = Some(watcher);
-    }
-
-    fn load_images_from_directory(&mut self, directory: &str) {
-        self.images.clear();
-
-        let mut entries: Vec<_> = WalkDir::new(directory)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .collect();
-
-        entries.sort_by(|a, b| a.path().cmp(b.path()));
-
-        for entry in entries {
-            if let Some(extension) = entry.path().extension() {
-                if let Some(ext_str) = extension.to_str() {
-                    if ext_str == "png" || ext_str == "jpg" || ext_str == "jpeg" {
-                        self.images.push(entry.path().to_str().unwrap().to_string());
+        let watcher_seq = image_sequence.clone();
+        let watcher = notify::recommended_watcher(move |res| match res {
+            Ok(notify::Event { kind, .. }) => {
+                if kind.is_modify() || kind.is_create() || kind.is_remove() {
+                    let mut image_sequence = watcher_seq.lock().unwrap();
+                    if let Some(image_sequence) = &mut *image_sequence {
+                        image_sequence.reload();
                     }
                 }
             }
-        }
-    }
+            Err(e) => println!("watch error: {:?}", e),
+        }).unwrap();
 
-    fn load_current_image(&self) -> Option<egui_extras::RetainedImage> {
-        Some(
-            RetainedImage::from_image_bytes(
-                self.images[self.idx].clone(),
-                &std::fs::read(self.images[self.idx].clone()).unwrap(),
-            )
-            .unwrap(),
-        )
+        Self {
+            image_sequence,
+            watcher,
+            idx: 0,
+            playing: true,
+        }
     }
 }
 
@@ -98,51 +52,64 @@ impl eframe::App for ImageSequencerApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            if self.directory.is_some() {
-                ui.heading(format!(
-                    "Current Directory: {}",
-                    self.directory.as_ref().unwrap()
-                ));
+            let mut image_sequence = self.image_sequence.lock().unwrap();
 
-                if let Some(img) = self.load_current_image() {
-                    ui.add(egui::Image::new(img.texture_id(ctx), img.size_vec2()));
+            if let Some(image_sequence) = &mut *image_sequence {
+                ui.heading(format!("Current Directory: {:?}", image_sequence.directory));
 
-                    self.idx = (self.idx + 1) % self.images.len();
-                    ctx.request_repaint();
+                if !image_sequence.images.is_empty() {
+                    if self.idx >= image_sequence.images.len() {
+                        self.idx = image_sequence.images.len();
+                    }
+
+                    if let Some(img) = image_sequence.load_frame(self.idx) {
+                        ui.add(egui::Image::new(img.texture_id(ctx), img.size_vec2()));
+                        ctx.request_repaint();
+                    }
+
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{} / {}", self.idx + 1, image_sequence.images.len()));
+                        ui.add(egui::Slider::new(&mut self.idx, 0..=image_sequence.images.len() - 1));
+                    });
+
+                    if self.playing {
+                        self.idx = (self.idx + 1) % image_sequence.images.len();
+                    }
                 }
-
-                ui.horizontal(|ui| {
-                    ui.label(format!("{} / {}", self.idx + 1, self.images.len()));
-                    ui.add(egui::Slider::new(&mut self.idx, 0..=self.images.len() - 1));
-                });
             }
 
             if ui.button("Open Directory").clicked() {
-                let result = nfd::open_pick_folder(None).unwrap_or_else(|e| {
-                    panic!("{}", e);
-                });
+                let result = nfd::open_pick_folder(None).unwrap();
 
                 match result {
                     nfd::Response::Okay(path) => {
                         println!("Path = {:?}", path);
-                        self.watch_directory(path.as_str());
-                        self.load_images_from_directory(path.as_str());
-                        self.directory = Some(path);
+                        let path = Path::new(path.as_str());
+
+                        if let Some(image_sequence) = &mut *image_sequence {
+                            self.watcher.unwatch(&image_sequence.directory).unwrap();
+                        }
+
+                        self.watcher.watch(&path, RecursiveMode::NonRecursive).unwrap();
+
+                        let mut new_sequence = ImageSequence::new(&path);
+                        new_sequence.reload();
+                        *image_sequence = Some(new_sequence);
                     }
-                    nfd::Response::OkayMultiple(paths) => {
-                        println!("Paths = {:?}", paths);
-                    }
-                    nfd::Response::Cancel => println!("User canceled"),
+
+                    _ => {}
                 }
             }
 
-            if !self.images.is_empty() {
-                if ui.button("Reload Directory").clicked() {}
+            if let Some(image_sequence) = &mut *image_sequence {
+                if ui.button("Reload Directory").clicked() {
+                    image_sequence.reload();
+                }
             }
 
             // stops the animation but doesn't clear directory
-            if ui.button("Stop").clicked() {
-                self.images.clear();
+            if ui.button(if self.playing { "Stop" } else { "Play" }).clicked() {
+                self.playing = !self.playing;
             }
         });
     }
